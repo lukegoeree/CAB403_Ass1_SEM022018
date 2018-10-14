@@ -3,4 +3,4 @@
 *.out
 *.app
 *.hex
-*.stackdump
+*.exe.stackdump

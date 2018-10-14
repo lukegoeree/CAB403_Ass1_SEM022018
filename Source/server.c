@@ -1,11 +1,11 @@
-/**
-*CAB403 Semester 02; 2018
-*Assignment: Process Management and Distributed Computing
-*Assignment 1
-*
-*Server Side
-*Author: Luke Goeree 20/09/2018
-**/
+/*
+**CAB403 Semester 02; 2018
+**Assignment: Process Management and Distributed Computing
+**Assignment 1
+**
+**Server Side
+**Author: Luke Goeree 20/09/2018
+*/
 
 //Included Libraries
 #include <stdio.h>
@@ -17,43 +17,38 @@
 #include <unistd.h>
 
 //Static Definitions
+#define AND &&
+#define OR ||
 #define SOCKET_ERROR -1
 #define USER_DETAILS_BLOCK 20
 #define DEFAULT_SERVER_PORT 12345
 #define REQUEST_BACKLOG 10
-#define AUTH_FILE "authentication.txt"
-
+#define AUTH_FILE "Authentication.txt"
 
 //Custom Structs
-
-/*
-** Custome Struct to describe all authenticated players
-*/
+/**Custome Struct to describe all authenticated players**/
 struct authedPlayer{
 	char name[USER_DETAILS_BLOCK];
 	char password[USER_DETAILS_BLOCK];
 };
 typedef struct authedPlayer authedPlayer_t;
 
-
 //Global Variables
 int debug_mode = 1;
-authedPlayer_t* authPlayers;
-int numUsers = -1;
+authedPlayer_t* authedPlayers;
+int numUsers = -1;	//skip the file headers
 volatile int serverProcessing = 1;
 
 
-
-
-
-
-
+/*
+**Function to import users from Authentication.txt into authedPlayer struct types
+*/
 void importUsers(){
 	FILE *fp;
 	char *line = NULL;
 	size_t len = 0; //allows only positive return values, i.e. 0 - 65535 unsigned
 	ssize_t read; //allows a return value of negative numbers, i.e. -1 signed
-	char after_white;
+	char whiteSpace;
 
 	fp = fopen(AUTH_FILE, "r");
 	
@@ -63,7 +58,7 @@ void importUsers(){
 		exit(1);
 	}
 
-	//Debugging Section to ensure correct file details are being imported
+	/**Debugging Section to ensure correct file details are being imported**/
 	if(debug_mode==1){
 		printf("File is open\n");//debugging line
 		char linetwo[256];//debugging line
@@ -72,56 +67,69 @@ void importUsers(){
 			numUsers++;//debugging line
 			printf("%s", linetwo);//debugging line
 		}
-		printf("\n");
-		printf("printf numUsers: \t%d\n",numUsers);//debugging line
 		numUsers = -1;
-		printf("reset numUsers: \t%d\n",numUsers);//debugging line
-	}
+		rewind(fp);
+	}//end debug
 	
+	/**count players listed in auth file**/
 	while((read=getline(&line,&len,fp))!=-1){
 		numUsers++;
-		printf("getline numUsers: \t%d\n",numUsers);//debugging line
 	}
 
-	authPlayers = malloc(numUsers * sizeof(*authPlayers));
-	rewind(fp);
-	if(debug_mode==1){printf("Rewind Completed\n");}
+	/**Allocate memory for list of authenticated players**/
+	authedPlayers = malloc(numUsers * sizeof(*authedPlayers));
+	if(authedPlayers==NULL){
+		printf("authedPlayers is NULL\n");
+		perror("authedPlayers List is NULL");
+		exit(1);
+	}
+	rewind(fp);	//set cursor to beginning of file
 
 	for(int i = -1; (read=getline(&line,&len,fp))!=-1; ++i){
 		if(debug_mode==1){printf("Import Users: First For Loop; iloop #: %d\n", i);}
 		if(i==-1) continue;
-		after_white = 0;
+		whiteSpace = 0;
 		int j = 0;
 		while(1){
-			if(debug_mode==1){printf("Import Users: Entering While Loop\n", i);}
-			if(line[j]=='\n'||line[j]=='\r'||line[j]=='\0'){
-				authPlayers[i].password[j - after_white] = '\0';
+			if(line[j]=='\n' OR line[j]=='\r' OR line[j]=='\0'){
+				authedPlayers[i].password[j - whiteSpace] = '\0';
 				break;
 			}
-			else if(line[j]!=' ' && line[j]!='\t'){
-				if((j>0 && line[j-1]==' ')||line[j-1]=='\t'){
-					after_white = j;
+			else if(line[j]!=' ' AND line[j]!='\t'){
+				if((j>0 && line[j-1]==' ') OR line[j-1]=='\t'){
+					whiteSpace = j;
 				}
-				if(after_white){
-					authPlayers[i].password[j-after_white] = line[j];
+				if(whiteSpace){
+					authedPlayers[i].password[j-whiteSpace] = line[j];
 				} else {
-					authPlayers[i].name[j] = line[j];
+					authedPlayers[i].name[j] = line[j];
 				}
-				if(line[j+1]==' '||line[j+1]=='\t'){
-					authPlayers[i].name[j+1] = '\0';
+				if(line[j+1]==' ' OR line[j+1]=='\t'){
+					authedPlayers[i].name[j+1] = '\0';
 				}
 			}
 			j++;
 		}
+		if(debug_mode==1){
+			printf("Username: ");
+			for(int k=0;k<=j;k++){
+				printf("%c", line[k]);
+				if(line[k]=='\t'){
+					k = k+1;
+					printf("\n");
+					printf("Password: ");
+				}
+			}
+		}
+		printf("\n");
 	}
-
 	fclose(fp);
 }
 
-
-
-/*Signal Interrupt
-Interrupts the process cycle via user input (i.e. CTRL+C)*/
+/*
+**Signal Interrupt
+**Interrupts the process cycle via user input (i.e. CTRL+C)
+*/
 void sigint_handler(int signal){
 	if(signal==SIGINT){
 		serverProcessing = 0;
@@ -129,37 +137,44 @@ void sigint_handler(int signal){
 	}
 }
 
+/*
+**Rotating waiting cursor while server waits
+*/
+void waitingCursur(){
+	char chars[] = {'-','\\','|','/'};
+	for(int i=0;serverProcessing!=0;++i){
+		printf("%c\r",chars[i % sizeof(chars)]);
+		fflush(stdout);
+		usleep(200000);
+	}
+}
 
-
-
-//Main Function
+/*
+**Main Function
+*/
 int main(int argc, char* argv[]){
 
 	int socketFd;
 	int clientFd;
 	int serverPort = DEFAULT_SERVER_PORT;
-
 	struct sockaddr_in serverAddress;
 
 	signal(SIGINT, sigint_handler);
-
 	importUsers();
 
 	if(argc>1){
 		serverPort = atoi(argv[1]);
 	}
-	if(debug_mode==1){printf("Server Side Running!\n");}
 
-	/*	
-	**	Socket Structures as per 
-	**	www.gta.ufrj.br/ensino/eel878/sockets/sockaddr_inman.html
-	*/
+	
+	/**	Socket Structures as per 
+		www.gta.ufrj.br/ensino/eel878/sockets/sockaddr_inman.html**/
 	memset(&serverAddress, 0, sizeof(serverAddress));
 	serverAddress.sin_family = AF_INET;
 	serverAddress.sin_port = htons(serverPort);
 	serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	//Socket Operations
+	/**Socket Operations**/
 	if(debug_mode==1){printf("Creating Socket\n");}
 	socketFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
 	if(socketFd==SOCKET_ERROR){
@@ -178,16 +193,15 @@ int main(int argc, char* argv[]){
 		exit(1);
 	}
 
-	//Debugging Section to ensure correct details are being parsed
+	/**Debugging Section to ensure correct details are being parsed**/
 	if(debug_mode==1){
 		printf("Socket Being Used: %d\n", socketFd);
 		printf("Port Being Used: %d\n", serverPort);
 	}
-
-	
 	
 	while(serverProcessing){
 		//TO DO: Main server processing
+		waitingCursur();
 	}
 	close(socketFd);
 	return 0;

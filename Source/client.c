@@ -6,3 +6,16 @@
 *Client Side
 *Author: Luke Goeree 20/09/2018
 **/
+
+
+
+
+
+
+
+
+//Main Function
+int main(int argc, char* argv[]){
+
+	return 0;
+}

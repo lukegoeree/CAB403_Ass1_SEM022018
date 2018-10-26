@@ -37,6 +37,7 @@
 #define USER_DETAILS_BLOCK 30
 #define DEFAULT_SERVER_PORT 12345
 #define REQUEST_BACKLOG 10
+#define NUM_THREADS 10
 #define AUTH_FILE "Authentication.txt"
 
 //Custom Structs
@@ -53,8 +54,13 @@ struct request{
 };
 typedef struct request request_t;
 
+//Global Debugging
+int globalDebug_UserFile = 0;
+int globalDebug_Socket = 1;
+int globalDebug_Process = 1;
+//int globalDebugMode = 1;
 //Global Variables
-int globalDebugMode = 1;
+
 authedPlayer_t* authedPlayers;
 int globalNumUsers = -1;	//skip the file headers
 request_t* waitHead = NULL;
@@ -62,9 +68,9 @@ request_t* waitTail = NULL;
 volatile int globalSrvrProc = 1;
 
 //Process Synchronisation: semaphore for multiple thread lock/unlock
-pthread_mutex_t waitMut = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+pthread_mutex_t waitMut = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t gotReq = PTHREAD_COND_INITIALIZER;
-pthread_mutex_t readCntMut = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+pthread_mutex_t readCntMut = PTHREAD_MUTEX_INITIALIZER;
 sem_t writeMut;
 int readCnt = 0;
 
@@ -94,6 +100,8 @@ int recvString(int fd, char* string){
 
 //handle_client
 void clientOp(int threadID, int fd){
+	int userID = -1;
+	int i;
 	char plyrUsrnm[USER_DETAILS_BLOCK];
 	char plyrPwd[USER_DETAILS_BLOCK];
 
@@ -108,9 +116,74 @@ void clientOp(int threadID, int fd){
 		return;
 	}
 
+	for(i=0;i<globalNumUsers;i++){
+		if(strcmp(plyrUsrnm, authedPlayers[i].name) == 0){
+			userID = i;
+			break;
+		}
+	}
+	if(userID==SOCKET_ERROR OR strcmp(plyrPwd, authedPlayers[i].password) != 0){
+		sendIntTrig(fd,0); //login failed
+		return;
+	}
+
 }
 
+int sendIntTrig(int fd, int data){
+	int remCon;
+	uint16_t num;
+	num = htons(data);
+	remCon = send(fd,&num,sizeof(uint16_t),0);
+	if(remCon==SOCKET_ERROR){
+		return COMM_ERROR;
+	}
+	return COMM_NORM;
+}
 
+void* cleanupThread(void* data){
+	request_t* req = *((request_t**) data);
+	if(req!=NULL){
+		sendIntTrig(req->serverFd, TERM_VALUE);
+		shutdown(req->serverFd, SHUT_RDWR);
+		close(req->serverFd);
+		free(req);
+	}
+	pthread_mutex_unlock(&waitMut);
+}
+
+void* clientRequest(void* data){
+	int threadID = *((int*) data);
+	request_t* req = NULL;
+
+	pthread_cleanup_push(cleanupThread,(void*)&req);
+	pthread_mutex_lock(&waitMut);
+	while(1){
+		pthread_testcancel();
+		if(waitHead!=NULL){
+			req = waitHead;
+			if(waitHead->next!=NULL){
+				waitHead = waitHead->next;
+			} else{
+				waitHead = NULL;
+				waitTail = NULL;
+			}
+			pthread_mutex_unlock(&waitMut);
+			printf("Client #%i has connected!\n", req->serverFd);
+			fflush(stdout);
+			clientOp(threadID, req->serverFd);
+			shutdown(req->serverFd, SHUT_RDWR);
+			close(req->serverFd);
+			printf("Client #%i has disconnected!\n", req->serverFd);
+			fflush(stdout);
+			free(req);
+			req = NULL;
+			pthread_mutex_lock(&waitMut);
+		} else{
+			pthread_cond_wait(&gotReq, &waitMut);
+		}
+	}
+	pthread_cleanup_pop(cleanupThread);
+}
 
 
 
@@ -133,7 +206,7 @@ void importUsers(){
 	}
 
 	/**Debugging Section to ensure correct file details are being imported**/
-	if(globalDebugMode==1){
+	if(globalDebug_UserFile==1){
 		printf("File is open\n");//debugging line
 		char linetwo[256];//debugging line
 		printf("Printf of Auth.txt:\n");//debugging line
@@ -160,7 +233,7 @@ void importUsers(){
 	rewind(fp);	//set cursor to beginning of file
 
 	for(int i = -1; (read=getline(&line,&len,fp))!=-1; ++i){
-		if(globalDebugMode==1){printf("Import Users: First For Loop; iloop #: %d\n", i);}
+		if(globalDebug_UserFile==1){printf("Import Users: First For Loop; iloop #: %d\n", i);}
 		if(i==-1) continue;
 		whiteSpace = 0;
 		int j = 0;
@@ -184,7 +257,7 @@ void importUsers(){
 			}
 			j++;
 		}
-		if(globalDebugMode==1){
+		if(globalDebug_UserFile==1){
 			printf("Username: ");
 			for(int k=0;k<=j;k++){
 				printf("%c", line[k]);
@@ -207,7 +280,9 @@ void importUsers(){
 void sigint_handler(int signal){
 	if(signal==SIGINT){
 		globalSrvrProc = 0;
+		printf("Main Server Process = %i\n", globalSrvrProc);
 		fputs("Thank you for playing!\n", stdout);
+		//exit(1);
 	}
 }
 
@@ -223,23 +298,62 @@ void waitingCursur(){
 	}
 }
 
+void globalCleanup(){
+	request_t* reqClean;
+	request_t* tmpReqClean;
+	reqClean = waitHead;
+
+	//clear pending requests
+	while(reqClean!=NULL){
+		sendIntTrig(reqClean->serverFd, TERM_VALUE);
+		shutdown(reqClean->serverFd, SHUT_RDWR);
+		close(reqClean->serverFd);
+		tmpReqClean = reqClean->next;
+		free(reqClean);
+		reqClean = tmpReqClean;
+	}
+	free(authedPlayers);
+}
+
 /*
 **Main Function
 */
 int main(int argc, char* argv[]){
 
-	int socketFd;
-	int clientFd;
-	int serverPort = DEFAULT_SERVER_PORT;
-	struct sockaddr_in serverAddress;
-
+	int socketFd;//sockfd - listen on this socket
+	int clientFd;//new_fd - new client connection
+	int serverPort;
+	int threadIDs[NUM_THREADS];
+	struct sockaddr_in serverAddress;//my_addr
+	struct sockaddr_in clientAddress;//their_addr
+	socklen_t sin_size = sizeof(struct sockaddr *);
+	pthread_t threads[NUM_THREADS];
+	struct timespec sleep_spec;
+	sleep_spec.tv_sec = 0;
+  	sleep_spec.tv_nsec = 10000;
+	request_t* reqMain;
+/*	int remConMain = sem_init(writeMut,0,1);
+	if (remConMain!=0){
+    	perror("sem_init Error");
+    	exit(1);
+	}*/
 	signal(SIGINT, sigint_handler);
 	importUsers();
 
-	if(argc>1){
+	//Ensure Server program has some form of client port
+	if(argc!=2){
+		serverPort = DEFAULT_SERVER_PORT;
+	} else{
 		serverPort = atoi(argv[1]);
 	}
 
+	/**Socket Operations**/
+	if(globalDebug_Socket==1){printf("Creating Socket\n");}
+	socketFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	if(socketFd==SOCKET_ERROR){
+		perror("Socket Creation\n");
+		exit(1);
+	}
 	
 	/**	Socket Structures as per 
 		www.gta.ufrj.br/ensino/eel878/sockets/sockaddr_inman.html**/
@@ -248,35 +362,78 @@ int main(int argc, char* argv[]){
 	serverAddress.sin_port = htons(serverPort);
 	serverAddress.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	/**Socket Operations**/
-	if(globalDebugMode==1){printf("Creating Socket\n");}
-	socketFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-	if(socketFd==SOCKET_ERROR){
-		perror("Socket Creation\n");
-		exit(1);
-	}
-
-	if(bind(socketFd,(struct sockaddr*)&serverAddress,sizeof(struct sockaddr))==SOCKET_ERROR){
+	//Bind Socket to endpoint
+	if(bind(socketFd,(struct sockaddr*)&serverAddress,sizeof(struct sockaddr)) \
+	==SOCKET_ERROR){
 		perror("Socket Binding\n");
 		close(socketFd);
 		exit(1);
 	}
+
+	//Start Listening to socket
 	if(listen(socketFd,REQUEST_BACKLOG)==SOCKET_ERROR){
 		perror("Socket Listening\n");
 		close(socketFd);
 		exit(1);
 	}
 
+	printf("server starts listnening ...\n");
+
 	/**Debugging Section to ensure correct details are being parsed**/
-	if(globalDebugMode==1){
+	if(globalDebug_Socket==1){
 		printf("Socket Being Used: %d\n", socketFd);
 		printf("Port Being Used: %d\n", serverPort);
 	}
 	
+	//Create Threadpool
+	for(int i=0;i<NUM_THREADS;++i){
+		threadIDs[i] = i;
+		pthread_create(&threads[i], NULL, clientRequest, (void*) &threadIDs[i]);
+		if(globalDebug_Process==1){printf("Creating Threadpool: Thread #%i\n",i);}
+	}
+
 	while(globalSrvrProc){
 		//TO DO: Main server processing
 		waitingCursur();
+		clientFd = accept(socketFd,(struct sockaddr*)&clientAddress,&sin_size);
+		if(clientFd==SOCKET_ERROR){
+			if(errno==EAGAIN OR errno==EWOULDBLOCK){
+				nanosleep(&sleep_spec, NULL);
+			} else{
+				perror("Accept Error");
+			}
+			continue;
+		}
+/*		clientFd = accept(socketFd,(struct sockaddr*)&clientAddress,&sin_size);
+		if(clientFd==SOCKET_ERROR){
+			perror("Accept Error");
+			continue;
+		}*/
+		printf("Server: Got Connection from %s\n", inet_ntoa(clientAddress.sin_addr));
+		reqMain = malloc(sizeof(*reqMain));
+		reqMain->serverFd = clientFd;
+		reqMain->next = NULL;
+		pthread_mutex_lock(&waitMut);
+		if(globalDebug_Process==1){printf("Mutex locked\n");}
+		if(waitHead==NULL){
+			if(globalDebug_Process==1){printf("waitHead IF\n");}
+			waitHead = reqMain;
+			waitTail = reqMain;
+		} else{
+			if(globalDebug_Process==1){printf("waitHead ELSE\n");}
+			waitTail->next = reqMain;
+			waitTail = reqMain;
+		}
+		pthread_cond_signal(&gotReq);
+		pthread_mutex_unlock(&waitMut);
+		if(globalDebug_Process==1){printf("Main While Loop End\n");}
 	}
+	if(globalDebug_Process==1){printf("Main While Loop Exited\n");}
+	for(int i=0;i<NUM_THREADS;++i){
+		pthread_cancel(threads[i]);
+		pthread_join(threads[i],NULL);
+	}
+	globalCleanup();
 	close(socketFd);
 	return 0;
 }

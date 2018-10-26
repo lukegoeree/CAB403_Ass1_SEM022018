@@ -1,9 +1,9 @@
-CC = gcc
+CC = gcc -Wno-all
 CFLAGS =
 all: server client
 
 server:
-	$(CC) -o Server server.c $(CFLAGS)
+	$(CC) -o Server server.c -lpthread $(CFLAGS)
 
 client:
 	$(CC) -o Client client.c $(CFLAGS)

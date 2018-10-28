@@ -50,31 +50,53 @@
 #define PLYR_DETS_LEN 128
 #define GAME_WON 1
 #define GAME_LOST 2
+#define NUM_TILES_X 9
+#define NUM_TILES_Y 9
+#define NUM_MINES 10
+
+/**Borrowed Struct to enable boolean types
+https://stackoverflow.com/questions/1921539/using-boolean-values-in-c**/
+typedef enum{
+  false,true
+} bool;
 
 //Custom Structs
+/**Custome Struct to store state of the tile**/
+typedef struct Tile{
+  int adjacent_mines;
+  bool revealed;
+  bool is_mine;
+}Tile;
+
+/**Custome Struct to describe the games' state**/
+typedef struct GameState{
+  // Additional fields
+  int placed_flags;
+  bool game_over;
+  Tile tiles[NUM_TILES_X][NUM_TILES_Y];
+} GameState;
+
 /**Custome Struct to describe all authenticated players**/
-struct authedPlyr{
+typedef struct authedPlyr{
   char name[PLYR_DETS_LEN];
   char password[PLYR_DETS_LEN];
-};
-typedef struct authedPlyr authedPlyr_t;
+} authedPlyr_t;
 
 /**Custome Struct to describe entry to leaderboard**/
-struct leader{
+typedef struct leader{
   int authedPlyrID;
   int gamesWon;
   int gamesPlayed;
+  int gameTime;
   struct leader* prev;
   struct leader* next;
-};
-typedef struct leader leader_t;
+} leader_t;
 
 /**Custome Struct to describe client connection requests**/
-struct request{
+typedef struct request{
   int fd;
   struct request* next;
-};
-typedef struct request request_t;
+} request_t;
 
 //Global Variables
 authedPlyr_t* authedPlyrs;
@@ -86,12 +108,125 @@ request_t* waitHead = NULL;
 request_t* waitTail = NULL;
 volatile char procServer = 1;
 
+
 //Process Synchronisation: semaphore for multiple thread lock/unlock
 pthread_mutex_t waitMut = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 pthread_cond_t gotReq = PTHREAD_COND_INITIALIZER;
 sem_t writeMut;
 pthread_mutex_t rdCntMut = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 int rdCnt = 0;
+
+//Methods
+int sndStrTrig(int fd, char* string);
+int rcvStrTrig(int fd, char* string);
+int sndIntTrigs(int fd, int* data, int size);
+int sndIntTrig(int fd, int data);
+int rcvIntTrig(int fd, int* data);
+void importPlayers();
+void updateLeaderBoard(int authedPlyrID, int status);
+int sendClientLeaderBoard(int fd);
+int gameRound(int fd, int* status);
+void clientOp(int thread_id, int fd);
+void* cleanupThreads(void* data);
+void* clientRequest(void* data);
+void globalCleanup();
+void sigint_handler(int signal);
+
+/*
+**Main Function
+*/
+int main(int argc, char* argv[]){
+  int socketFd, clientFd, rc, i;
+  int threadIDs[NUM_THREADS];
+  pthread_t threads[NUM_THREADS];
+  struct sockaddr_in serverAddr;
+  struct sockaddr_in clientAddr;
+  socklen_t sin_size = sizeof(struct sockaddr *);
+  int srvrPort = DEFAULT_SERVER_PORT;
+  request_t* request;
+  struct timespec sleep_spec;
+  srand(RANDOM_NUMBER_SEED);
+  signal(SIGINT, sigint_handler);
+  sleep_spec.tv_sec = 0;
+  sleep_spec.tv_nsec = 10000;
+  rc = sem_init(&writeMut, 0, 1);
+
+  if(rc!=0){
+    perror("sem_init");
+    exit(1);
+  }
+  importPlayers();
+  //Ensure Server program has some form of client port
+  if(argc!=2){
+    srvrPort = DEFAULT_SERVER_PORT;
+  } else{
+    srvrPort = atoi(argv[1]);
+  }
+
+  /**Socket Operations**/
+  /** Socket Structures as per 
+    www.gta.ufrj.br/ensino/eel878/sockets/sockaddr_inman.html**/
+  memset(&serverAddr, 0, sizeof(serverAddr));
+  serverAddr.sin_family = AF_INET;
+  serverAddr.sin_port = htons(srvrPort);
+  serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  socketFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if(socketFd==SOCKET_ERROR){
+    perror("socket");
+    exit(1);
+  }
+  //Bind Socket to endpoint
+  if(bind(socketFd,(struct sockaddr*)&serverAddr,sizeof(struct sockaddr))==-1){
+    perror("bind");
+    close(socketFd);
+    exit(1);
+  }
+  //Start Listening to socket
+  if(listen(socketFd,REQUEST_BACKLOG)==SOCKET_ERROR){
+    perror("listen");
+    close(socketFd);
+    exit(1);
+  }
+  //Create Threadpool
+  for(i=0;i<NUM_THREADS;++i){
+    threadIDs[i] = i;
+    pthread_create(&threads[i],NULL, clientRequest,(void*)&threadIDs[i]);
+  }
+  // handle incoming client requests
+  while(procServer){
+    clientFd = accept(socketFd,(struct sockaddr*)&clientAddr,&sin_size);
+    if(clientFd==SOCKET_ERROR){
+      if(errno==EAGAIN OR errno==EWOULDBLOCK){
+        nanosleep(&sleep_spec,NULL);
+      } else{
+        perror("accept");
+      }
+      continue;
+    }
+    request = malloc(sizeof(*request));
+    request->fd = clientFd;
+    request->next = NULL;
+    pthread_mutex_lock(&waitMut);
+    if(waitHead==NULL){
+      waitHead = request;
+      waitTail = request;
+    } else{
+      waitTail->next = request;
+      waitTail = request;
+    }
+    pthread_cond_signal(&gotReq);
+    pthread_mutex_unlock(&waitMut);
+  }
+  //Cancel Threadpool
+  for(i=0;i<NUM_THREADS;++i){
+    pthread_cancel(threads[i]);
+    pthread_join(threads[i],NULL);
+  }
+  globalCleanup();
+  close(socketFd);
+  return 0;
+}
+
 
 int sndStrTrig(int fd, char* string){
   int i, rc;
@@ -517,99 +652,4 @@ void sigint_handler(int signal){
   if(signal==SIGINT){
     procServer = 0;
   }
-}
-
-/*
-**Main Function
-*/
-int main(int argc, char* argv[]){
-  int socketFd, clientFd, rc, i;
-  int threadIDs[NUM_THREADS];
-  pthread_t threads[NUM_THREADS];
-  struct sockaddr_in serverAddr;
-  struct sockaddr_in clientAddr;
-  socklen_t sin_size = sizeof(struct sockaddr *);
-  int srvrPort = DEFAULT_SERVER_PORT;
-  request_t* request;
-  struct timespec sleep_spec;
-  srand(RANDOM_NUMBER_SEED);
-  signal(SIGINT, sigint_handler);
-  sleep_spec.tv_sec = 0;
-  sleep_spec.tv_nsec = 10000;
-  rc = sem_init(&writeMut, 0, 1);
-
-  if(rc!=0){
-    perror("sem_init");
-    exit(1);
-  }
-  importPlayers();
-  //Ensure Server program has some form of client port
-  if(argc!=2){
-    srvrPort = DEFAULT_SERVER_PORT;
-  } else{
-    srvrPort = atoi(argv[1]);
-  }
-
-  /**Socket Operations**/
-  /** Socket Structures as per 
-    www.gta.ufrj.br/ensino/eel878/sockets/sockaddr_inman.html**/
-  memset(&serverAddr, 0, sizeof(serverAddr));
-  serverAddr.sin_family = AF_INET;
-  serverAddr.sin_port = htons(srvrPort);
-  serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-  socketFd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-  if(socketFd==SOCKET_ERROR){
-    perror("socket");
-    exit(1);
-  }
-  //Bind Socket to endpoint
-  if(bind(socketFd,(struct sockaddr*)&serverAddr,sizeof(struct sockaddr))==-1){
-    perror("bind");
-    close(socketFd);
-    exit(1);
-  }
-  //Start Listening to socket
-  if(listen(socketFd,REQUEST_BACKLOG)==SOCKET_ERROR){
-    perror("listen");
-    close(socketFd);
-    exit(1);
-  }
-  //Create Threadpool
-  for(i=0;i<NUM_THREADS;++i){
-    threadIDs[i] = i;
-    pthread_create(&threads[i],NULL, clientRequest,(void*)&threadIDs[i]);
-  }
-  // handle incoming client requests
-  while(procServer){
-    clientFd = accept(socketFd,(struct sockaddr*)&clientAddr,&sin_size);
-    if(clientFd==SOCKET_ERROR){
-      if(errno==EAGAIN OR errno==EWOULDBLOCK){
-        nanosleep(&sleep_spec,NULL);
-      } else{
-        perror("accept");
-      }
-      continue;
-    }
-    request = malloc(sizeof(*request));
-    request->fd = clientFd;
-    request->next = NULL;
-    pthread_mutex_lock(&waitMut);
-    if(waitHead==NULL){
-      waitHead = request;
-      waitTail = request;
-    } else{
-      waitTail->next = request;
-      waitTail = request;
-    }
-    pthread_cond_signal(&gotReq);
-    pthread_mutex_unlock(&waitMut);
-  }
-  //Cancel Threadpool
-  for(i=0;i<NUM_THREADS;++i){
-    pthread_cancel(threads[i]);
-    pthread_join(threads[i],NULL);
-  }
-  globalCleanup();
-  close(socketFd);
-  return 0;
 }

@@ -1,5 +1,5 @@
-CC = gcc
-CFLAGS =
+CC = gcc 
+CFLAGS = -Wno-incompatible-pointer-types
 all: server client
 
 server:
